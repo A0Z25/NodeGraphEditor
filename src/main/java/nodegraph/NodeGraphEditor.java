@@ -245,18 +245,26 @@ public class NodeGraphEditor extends Application {
     }
 
     /**
-     * A connection (edge) between two ports, drawn as a cubic curve with an arrowhead.
+     * Connection line mode: curved (Bezier) or straight.
+     */
+    enum ConnectionMode { CURVED, STRAIGHT }
+
+    /**
+     * A connection (edge) between two ports, drawn as a cubic curve or straight line with an arrowhead.
      */
     static class Connection {
         final Port source; // output port
         final Port target; // input port
         final CubicCurve curve;
+        final Line straightLine;
         final Polygon arrowHead;
         final Group group;
+        private ConnectionMode mode;
 
-        Connection(Port source, Port target) {
+        Connection(Port source, Port target, ConnectionMode mode) {
             this.source = source;
             this.target = target;
+            this.mode = mode;
 
             curve = new CubicCurve();
             curve.setStroke(Color.web("#444444"));
@@ -264,19 +272,47 @@ public class NodeGraphEditor extends Application {
             curve.setFill(Color.TRANSPARENT);
             curve.setStrokeLineCap(StrokeLineCap.ROUND);
 
+            straightLine = new Line();
+            straightLine.setStroke(Color.web("#444444"));
+            straightLine.setStrokeWidth(2.5);
+            straightLine.setStrokeLineCap(StrokeLineCap.ROUND);
+
             arrowHead = new Polygon();
             arrowHead.setFill(Color.web("#444444"));
 
-            group = new Group(curve, arrowHead);
+            group = new Group(curve, straightLine, arrowHead);
+            applyMode();
 
             source.connections.add(this);
             target.connections.add(this);
+        }
+
+        void setMode(ConnectionMode mode) {
+            this.mode = mode;
+            applyMode();
+        }
+
+        private void applyMode() {
+            curve.setVisible(mode == ConnectionMode.CURVED);
+            straightLine.setVisible(mode == ConnectionMode.STRAIGHT);
+        }
+
+        /** Returns the active shape used for hit-testing and hover effects. */
+        Shape getActiveShape() {
+            return mode == ConnectionMode.CURVED ? curve : straightLine;
         }
 
         void update(Group canvas) {
             Point2D start = source.getCenterInCanvas(canvas);
             Point2D end = target.getCenterInCanvas(canvas);
 
+            // Update straight line
+            straightLine.setStartX(start.getX());
+            straightLine.setStartY(start.getY());
+            straightLine.setEndX(end.getX());
+            straightLine.setEndY(end.getY());
+
+            // Update cubic curve
             double dx = Math.abs(end.getX() - start.getX()) * 0.5;
             dx = Math.max(dx, 50);
 
@@ -289,14 +325,16 @@ public class NodeGraphEditor extends Application {
             curve.setEndX(end.getX());
             curve.setEndY(end.getY());
 
-            // Arrowhead at end
-            double arrowSize = 10;
-            // Tangent at endpoint: derivative of cubic bezier at t=1
-            double tx = 3 * (end.getX() - (end.getX() - dx));
-            double ty = 3 * (end.getY() - end.getY());
-            // Simpler: direction from control point 2 to end
-            double dirX = end.getX() - (end.getX() - dx);
-            double dirY = end.getY() - end.getY();
+            // Arrowhead direction depends on mode
+            double dirX, dirY;
+            if (mode == ConnectionMode.STRAIGHT) {
+                dirX = end.getX() - start.getX();
+                dirY = end.getY() - start.getY();
+            } else {
+                // Direction from control point 2 to end
+                dirX = end.getX() - (end.getX() - dx);
+                dirY = end.getY() - end.getY();
+            }
             double len = Math.sqrt(dirX * dirX + dirY * dirY);
             if (len < 0.001) { dirX = 1; dirY = 0; len = 1; }
             dirX /= len;
@@ -305,6 +343,7 @@ public class NodeGraphEditor extends Application {
             double perpX = -dirY;
             double perpY = dirX;
 
+            double arrowSize = 10;
             double tipX = end.getX();
             double tipY = end.getY();
             double baseX = tipX - dirX * arrowSize;
@@ -334,9 +373,13 @@ public class NodeGraphEditor extends Application {
         final List<GraphNode> nodes = new ArrayList<>();
         final List<Connection> connections = new ArrayList<>();
 
+        // Connection line mode
+        private ConnectionMode connectionMode = ConnectionMode.CURVED;
+
         // For creating new connections by dragging from a port
         private Port dragSourcePort = null;
         private CubicCurve tempCurve = null;
+        private Line tempLine = null;
 
         // For panning
         private double panStartX, panStartY;
@@ -389,11 +432,32 @@ public class NodeGraphEditor extends Application {
                 canvas.setTranslateY(0);
             });
 
+            ToggleButton lineStyleBtn = new ToggleButton("Lines: Curved");
+            lineStyleBtn.setSelected(false);
+            lineStyleBtn.setOnAction(e -> {
+                if (lineStyleBtn.isSelected()) {
+                    connectionMode = ConnectionMode.STRAIGHT;
+                    lineStyleBtn.setText("Lines: Straight");
+                } else {
+                    connectionMode = ConnectionMode.CURVED;
+                    lineStyleBtn.setText("Lines: Curved");
+                }
+                // Update all existing connections
+                for (Connection c : connections) {
+                    c.setMode(connectionMode);
+                    c.update(canvas);
+                }
+                // Re-apply event handlers since active shape changed
+                for (Connection c : connections) {
+                    setupConnectionHandlers(c);
+                }
+            });
+
             Label hint = new Label("  Right-click canvas to add nodes | Drag from ports to connect | Scroll to zoom | Middle-click to pan");
             hint.setTextFill(Color.GRAY);
             hint.setFont(Font.font(11));
 
-            return new ToolBar(addNodeBtn, new Separator(), fitBtn, resetBtn, new Separator(), hint);
+            return new ToolBar(addNodeBtn, new Separator(), fitBtn, resetBtn, new Separator(), lineStyleBtn, new Separator(), hint);
         }
 
         private void drawGrid() {
@@ -542,65 +606,74 @@ public class NodeGraphEditor extends Application {
         void setupPortHandlers(Port port) {
             port.setOnMousePressed(e -> {
                 if (e.getButton() == MouseButton.PRIMARY) {
-                    // Start dragging a new connection
-                    if (port.type == Port.Type.OUTPUT) {
-                        dragSourcePort = port;
-                    } else {
-                        // Allow dragging from input too (will be reversed)
-                        dragSourcePort = port;
-                    }
-                    tempCurve = new CubicCurve();
-                    tempCurve.setStroke(Color.web("#00aa55"));
-                    tempCurve.setStrokeWidth(2.5);
-                    tempCurve.setStrokeDashOffset(0);
-                    tempCurve.getStrokeDashArray().addAll(8.0, 4.0);
-                    tempCurve.setFill(Color.TRANSPARENT);
-                    tempCurve.setMouseTransparent(true);
-
+                    dragSourcePort = port;
                     Point2D start = port.getCenterInCanvas(canvas);
-                    tempCurve.setStartX(start.getX());
-                    tempCurve.setStartY(start.getY());
-                    tempCurve.setEndX(start.getX());
-                    tempCurve.setEndY(start.getY());
-                    tempCurve.setControlX1(start.getX());
-                    tempCurve.setControlY1(start.getY());
-                    tempCurve.setControlX2(start.getX());
-                    tempCurve.setControlY2(start.getY());
 
-                    canvas.getChildren().add(tempCurve);
+                    if (connectionMode == ConnectionMode.STRAIGHT) {
+                        tempLine = new Line();
+                        tempLine.setStroke(Color.web("#00aa55"));
+                        tempLine.setStrokeWidth(2.5);
+                        tempLine.getStrokeDashArray().addAll(8.0, 4.0);
+                        tempLine.setMouseTransparent(true);
+                        tempLine.setStartX(start.getX());
+                        tempLine.setStartY(start.getY());
+                        tempLine.setEndX(start.getX());
+                        tempLine.setEndY(start.getY());
+                        canvas.getChildren().add(tempLine);
+                    } else {
+                        tempCurve = new CubicCurve();
+                        tempCurve.setStroke(Color.web("#00aa55"));
+                        tempCurve.setStrokeWidth(2.5);
+                        tempCurve.setStrokeDashOffset(0);
+                        tempCurve.getStrokeDashArray().addAll(8.0, 4.0);
+                        tempCurve.setFill(Color.TRANSPARENT);
+                        tempCurve.setMouseTransparent(true);
+                        tempCurve.setStartX(start.getX());
+                        tempCurve.setStartY(start.getY());
+                        tempCurve.setEndX(start.getX());
+                        tempCurve.setEndY(start.getY());
+                        tempCurve.setControlX1(start.getX());
+                        tempCurve.setControlY1(start.getY());
+                        tempCurve.setControlX2(start.getX());
+                        tempCurve.setControlY2(start.getY());
+                        canvas.getChildren().add(tempCurve);
+                    }
                     e.consume();
                 }
             });
 
             port.setOnMouseDragged(e -> {
-                if (tempCurve != null && dragSourcePort != null) {
+                if (dragSourcePort != null) {
                     Point2D mouse = canvas.sceneToLocal(e.getSceneX(), e.getSceneY());
                     Point2D start = dragSourcePort.getCenterInCanvas(canvas);
 
-                    tempCurve.setEndX(mouse.getX());
-                    tempCurve.setEndY(mouse.getY());
+                    if (tempLine != null) {
+                        tempLine.setEndX(mouse.getX());
+                        tempLine.setEndY(mouse.getY());
+                    } else if (tempCurve != null) {
+                        tempCurve.setEndX(mouse.getX());
+                        tempCurve.setEndY(mouse.getY());
 
-                    double dx = Math.abs(mouse.getX() - start.getX()) * 0.5;
-                    dx = Math.max(dx, 40);
-                    if (dragSourcePort.type == Port.Type.OUTPUT) {
-                        tempCurve.setControlX1(start.getX() + dx);
-                        tempCurve.setControlX2(mouse.getX() - dx);
-                    } else {
-                        tempCurve.setControlX1(start.getX() - dx);
-                        tempCurve.setControlX2(mouse.getX() + dx);
+                        double dx = Math.abs(mouse.getX() - start.getX()) * 0.5;
+                        dx = Math.max(dx, 40);
+                        if (dragSourcePort.type == Port.Type.OUTPUT) {
+                            tempCurve.setControlX1(start.getX() + dx);
+                            tempCurve.setControlX2(mouse.getX() - dx);
+                        } else {
+                            tempCurve.setControlX1(start.getX() - dx);
+                            tempCurve.setControlX2(mouse.getX() + dx);
+                        }
+                        tempCurve.setControlY1(start.getY());
+                        tempCurve.setControlY2(mouse.getY());
                     }
-                    tempCurve.setControlY1(start.getY());
-                    tempCurve.setControlY2(mouse.getY());
 
-                    // Highlight nearby compatible ports
                     highlightCompatiblePort(e.getSceneX(), e.getSceneY());
                     e.consume();
                 }
             });
 
             port.setOnMouseReleased(e -> {
-                if (tempCurve != null && dragSourcePort != null) {
-                    // Check if released over a compatible port
+                if (dragSourcePort != null && (tempCurve != null || tempLine != null)) {
                     Port target = findPortAt(e.getSceneX(), e.getSceneY());
                     if (target != null && target != dragSourcePort &&
                             target.parentNode != dragSourcePort.parentNode &&
@@ -615,7 +688,6 @@ public class NodeGraphEditor extends Application {
                             dst = dragSourcePort;
                         }
 
-                        // Check if connection already exists
                         boolean exists = connections.stream().anyMatch(
                                 c -> c.source == src && c.target == dst);
                         if (!exists) {
@@ -623,8 +695,14 @@ public class NodeGraphEditor extends Application {
                         }
                     }
 
-                    canvas.getChildren().remove(tempCurve);
-                    tempCurve = null;
+                    if (tempCurve != null) {
+                        canvas.getChildren().remove(tempCurve);
+                        tempCurve = null;
+                    }
+                    if (tempLine != null) {
+                        canvas.getChildren().remove(tempLine);
+                        tempLine = null;
+                    }
                     dragSourcePort = null;
                     clearPortHighlights();
                     e.consume();
@@ -648,26 +726,38 @@ public class NodeGraphEditor extends Application {
         }
 
         void createConnection(Port source, Port target) {
-            Connection conn = new Connection(source, target);
+            Connection conn = new Connection(source, target, connectionMode);
             connections.add(conn);
             canvas.getChildren().add(0, conn.group); // Add behind nodes
             conn.update(canvas);
+            setupConnectionHandlers(conn);
+        }
 
-            // Setup click to delete on the curve
-            conn.curve.setOnMouseClicked(e -> {
+        private void setupConnectionHandlers(Connection conn) {
+            // Clear old handlers from both shapes
+            conn.curve.setOnMouseClicked(null);
+            conn.curve.setOnMouseEntered(null);
+            conn.curve.setOnMouseExited(null);
+            conn.curve.setCursor(Cursor.DEFAULT);
+            conn.straightLine.setOnMouseClicked(null);
+            conn.straightLine.setOnMouseEntered(null);
+            conn.straightLine.setOnMouseExited(null);
+            conn.straightLine.setCursor(Cursor.DEFAULT);
+
+            Shape shape = conn.getActiveShape();
+            shape.setCursor(Cursor.HAND);
+            shape.setOnMouseClicked(e -> {
                 if (e.getButton() == MouseButton.SECONDARY) {
                     ContextMenu menu = new ContextMenu();
                     MenuItem del = new MenuItem("Delete Connection");
                     del.setOnAction(ev -> removeConnection(conn));
                     menu.getItems().add(del);
-                    menu.show(conn.curve, e.getScreenX(), e.getScreenY());
+                    menu.show(shape, e.getScreenX(), e.getScreenY());
                     e.consume();
                 }
             });
-            conn.curve.setCursor(Cursor.HAND);
-            conn.curve.setStrokeWidth(2.5);
-            conn.curve.setOnMouseEntered(e -> conn.curve.setStroke(Color.web("#cc4444")));
-            conn.curve.setOnMouseExited(e -> conn.curve.setStroke(Color.web("#444444")));
+            shape.setOnMouseEntered(e -> shape.setStroke(Color.web("#cc4444")));
+            shape.setOnMouseExited(e -> shape.setStroke(Color.web("#444444")));
         }
 
         private Port findPortAt(double sceneX, double sceneY) {
